@@ -69,19 +69,34 @@ public final class AWSGlueClientFactory implements GlueClientFactory {
       return glueClientBuilder.build();
     } catch (Exception e) {
       String message = "Unable to build AWSGlueClient: " + e;
+      logger.error("** databricks *** :can't build aws glue client:", e);
       logger.error(message);
       throw new MetaException(message);
     }
   }
 
   private AWSCredentialsProvider getAWSCredentialsProvider(HiveConf conf) {
-    Class<? extends AWSCredentialsProviderFactory> providerFactoryClass = conf
-        .getClass(AWS_CATALOG_CREDENTIALS_PROVIDER_FACTORY_CLASS,
-            DefaultAWSCredentialsProviderFactory.class).asSubclass(
-            AWSCredentialsProviderFactory.class);
-    AWSCredentialsProviderFactory provider = ReflectionUtils.newInstance(
-        providerFactoryClass, conf);
-    return provider.buildAWSCredentialsProvider(conf);
+    try {
+      String className =  conf.getTrimmed(AWS_CATALOG_CREDENTIALS_PROVIDER_FACTORY_CLASS);
+      Class<?> clazz = conf.getClassByNameOrNull(className);
+      if (clazz == null) {
+        throw new ClassNotFoundException("Class " + className + " not found");
+      }
+      logger.info("Class: " + clazz.getName() + ", Loader: " + clazz.getClassLoader());
+      logger.info("Class: " + conf.getClass().getName() + ", Loader: " + conf.getClass().getClassLoader());
+      Class<? extends AWSCredentialsProviderFactory> providerFactoryClass = clazz.asSubclass(
+                      AWSCredentialsProviderFactory.class);
+      AWSCredentialsProviderFactory provider = ReflectionUtils.newInstance(
+              providerFactoryClass, conf);
+      return provider.buildAWSCredentialsProvider(conf);
+    } catch (ClassNotFoundException e) {
+      e.printStackTrace();
+    }
+    catch (ClassCastException e) {
+        e.printStackTrace();
+        logger.error("Failed to cast the class to AWSCredentialsProviderFactory");
+    }
+    return null;
   }
 
   private ClientConfiguration buildClientConfiguration(HiveConf hiveConf) {
