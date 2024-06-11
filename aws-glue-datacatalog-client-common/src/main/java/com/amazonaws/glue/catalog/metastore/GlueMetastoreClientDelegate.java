@@ -27,7 +27,6 @@ import com.amazonaws.services.glue.model.UserDefinedFunction;
 import com.amazonaws.services.glue.model.UserDefinedFunctionInput;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.conf.Configuration;
@@ -79,6 +78,7 @@ import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.hadoop.hive.metastore.api.UnknownTableException;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
+import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 
@@ -91,9 +91,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -125,14 +125,8 @@ public class GlueMetastoreClientDelegate {
   public static final String MATCH_ALL = ".*";
   private static final int BATCH_CREATE_PARTITIONS_MAX_REQUEST_SIZE = 100;
 
-  private static final int NUM_EXECUTOR_THREADS = 5;
   static final String GLUE_METASTORE_DELEGATE_THREADPOOL_NAME_FORMAT = "glue-metastore-delegate-%d";
-  private static final ExecutorService GLUE_METASTORE_DELEGATE_THREAD_POOL = Executors.newFixedThreadPool(
-          NUM_EXECUTOR_THREADS,
-          new ThreadFactoryBuilder()
-                  .setNameFormat(GLUE_METASTORE_DELEGATE_THREADPOOL_NAME_FORMAT)
-                  .setDaemon(true).build()
-  );
+  public static final String CUSTOM_EXECUTOR_FACTORY_CONF = "hive.metastore.executorservice.factory.class";
 
   private final AWSGlueMetastore glueMetastore;
   private final Configuration conf;
@@ -140,9 +134,23 @@ public class GlueMetastoreClientDelegate {
   private final AwsGlueHiveShims hiveShims = ShimsLoader.getHiveShims();
   private final CatalogToHiveConverter catalogToHiveConverter;
   private final String catalogId;
+  private final ExecutorService executorService;
 
   public static final String CATALOG_ID_CONF = "hive.metastore.glue.catalogid";
   public static final String NUM_PARTITION_SEGMENTS_CONF = "aws.glue.partition.num.segments";
+
+  private final static Map<String, ExecutorService> THREAD_POOL_MAP = new ConcurrentHashMap<>();
+
+  protected ExecutorService getExecutorService() {
+      String executorFactoryClassName = this.conf.getClass(CUSTOM_EXECUTOR_FACTORY_CONF, DefaultExecutorServiceFactory.class).getName();
+      return THREAD_POOL_MAP.computeIfAbsent(executorFactoryClassName, key -> {
+          Class<? extends ExecutorServiceFactory> executorFactoryClass = conf
+                  .getClass(CUSTOM_EXECUTOR_FACTORY_CONF, DefaultExecutorServiceFactory.class)
+                  .asSubclass(ExecutorServiceFactory.class);
+          ExecutorServiceFactory factory = ReflectionUtils.newInstance(executorFactoryClass, conf);
+          return factory.getExecutorService(conf);
+      });
+  }
 
   public GlueMetastoreClientDelegate(Configuration conf, AWSGlueMetastore glueMetastore,
                                      Warehouse wh) throws MetaException {
@@ -156,6 +164,7 @@ public class GlueMetastoreClientDelegate {
     this.wh = wh;
     // TODO - May be validate catalogId confirms to AWS AccountId too.
     catalogId = MetastoreClientUtils.getCatalogId(conf);
+    this.executorService = getExecutorService();
   }
 
   // ======================= Database =======================
@@ -665,7 +674,7 @@ public class GlueMetastoreClientDelegate {
       int j = Math.min(i + BATCH_CREATE_PARTITIONS_MAX_REQUEST_SIZE, catalogPartitions.size());
       final List<Partition> partitionsOnePage = catalogPartitions.subList(i, j);
 
-      batchCreatePartitionsFutures.add(GLUE_METASTORE_DELEGATE_THREAD_POOL.submit(new Callable<BatchCreatePartitionsHelper>() {
+      batchCreatePartitionsFutures.add(this.executorService.submit(new Callable<BatchCreatePartitionsHelper>() {
         @Override
         public BatchCreatePartitionsHelper call() throws Exception {
           return new BatchCreatePartitionsHelper(glueMetastore, dbName, tableName, catalogId, partitionsOnePage, ifNotExists)
@@ -865,7 +874,7 @@ public class GlueMetastoreClientDelegate {
           List<Column> newCols) throws TException {
     List<Pair<Partition, Future>> partitionFuturePairs = Collections.synchronizedList(Lists.newArrayList());
     partitions.parallelStream().forEach(partition -> partitionFuturePairs.add(Pair.of(partition,
-            (GLUE_METASTORE_DELEGATE_THREAD_POOL.submit(
+            (this.executorService.submit(
                     () -> alterPartitionColumns(databaseName, tableName, partition, newCols))))));
 
     List<List<String>> failedPartitionValues = new ArrayList<>();

@@ -87,6 +87,7 @@ import org.apache.hadoop.hive.metastore.api.UnknownTableException;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.api.CompactionResponse;
 import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
+import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 
@@ -98,6 +99,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -119,19 +121,25 @@ public class AWSCatalogMetastoreClient implements IMetaStoreClient {
   private final GlueMetastoreClientDelegate glueMetastoreClientDelegate;
   private final String catalogId;
   private final CatalogToHiveConverter catalogToHiveConverter;
+  private final ExecutorService executorService;
 
   private static final int BATCH_DELETE_PARTITIONS_PAGE_SIZE = 25;
-  private static final int BATCH_DELETE_PARTITIONS_THREADS_COUNT = 5;
-  static final String BATCH_DELETE_PARTITIONS_THREAD_POOL_NAME_FORMAT = "batch-delete-partitions-%d";
-  private static final ExecutorService BATCH_DELETE_PARTITIONS_THREAD_POOL = Executors.newFixedThreadPool(
-    BATCH_DELETE_PARTITIONS_THREADS_COUNT,
-    new ThreadFactoryBuilder()
-      .setNameFormat(BATCH_DELETE_PARTITIONS_THREAD_POOL_NAME_FORMAT)
-      .setDaemon(true).build()
-  );
+  public static final String CUSTOM_EXECUTOR_FACTORY_CONF = "hive.metastore.executorservice.factory.class";
+  private final static Map<String, ExecutorService> THREAD_POOL_MAP = new ConcurrentHashMap<>();
 
   private final AwsGlueHiveShims hiveShims = ShimsLoader.getHiveShims();
   private Map<String, String> currentMetaVars;
+
+  protected ExecutorService getExecutorService() {
+    String executorFactoryClassName = this.conf.getClass(CUSTOM_EXECUTOR_FACTORY_CONF, DefaultExecutorServiceFactory.class).getName();
+    return THREAD_POOL_MAP.computeIfAbsent(executorFactoryClassName, key -> {
+        Class<? extends ExecutorServiceFactory> executorFactoryClass = conf
+                .getClass(CUSTOM_EXECUTOR_FACTORY_CONF, DefaultExecutorServiceFactory.class)
+                .asSubclass(ExecutorServiceFactory.class);
+        ExecutorServiceFactory factory = ReflectionUtils.newInstance(executorFactoryClass, conf);
+        return factory.getExecutorService(conf);
+    });
+}
 
   public AWSCatalogMetastoreClient(HiveConf conf, HiveMetaHookLoader hook) throws MetaException {
     this.conf = conf;
@@ -144,6 +152,7 @@ public class AWSCatalogMetastoreClient implements IMetaStoreClient {
 
     AWSGlueMetastore glueMetastore = new AWSGlueMetastoreFactory().newMetastore(conf);
     glueMetastoreClientDelegate = new GlueMetastoreClientDelegate(this.conf, glueMetastore, wh);
+    this.executorService = getExecutorService();
 
     snapshotActiveConf();
     if (!doesDefaultDBExist()) {
@@ -163,6 +172,7 @@ public class AWSCatalogMetastoreClient implements IMetaStoreClient {
     private boolean createDefaults = true;
     private String catalogId;
     private GlueMetastoreClientDelegate glueMetastoreClientDelegate;
+    private ExecutorService executorService;
 
     public Builder withHiveConf(HiveConf conf) {
       this.conf = conf;
@@ -186,6 +196,11 @@ public class AWSCatalogMetastoreClient implements IMetaStoreClient {
 
     public Builder withGlueMetastoreClientDelegate(GlueMetastoreClientDelegate clientDelegate) {
       this.glueMetastoreClientDelegate = clientDelegate;
+      return this;
+    }
+
+    public Builder withExecutorService(ExecutorService executorService) {
+      this.executorService = executorService;
       return this;
     }
 
@@ -226,6 +241,8 @@ public class AWSCatalogMetastoreClient implements IMetaStoreClient {
     glueClient = clientFactory.newClient();
     AWSGlueMetastore glueMetastore = metastoreFactory.newMetastore(conf);
     glueMetastoreClientDelegate = new GlueMetastoreClientDelegate(this.conf, glueMetastore, wh);
+
+    executorService = getExecutorService();
 
     /**
      * It seems weird to create databases as part of glueClient construction. This
@@ -745,7 +762,7 @@ public class AWSCatalogMetastoreClient implements IMetaStoreClient {
           int j = Math.min(i + BATCH_DELETE_PARTITIONS_PAGE_SIZE, numOfPartitionsToDelete);
           final List<Partition> partitionsOnePage = partitionsToDelete.subList(i, j);
 
-          batchDeletePartitionsFutures.add(BATCH_DELETE_PARTITIONS_THREAD_POOL.submit(new Callable<BatchDeletePartitionsHelper>() {
+          batchDeletePartitionsFutures.add(this.executorService.submit(new Callable<BatchDeletePartitionsHelper>() {
               @Override
               public BatchDeletePartitionsHelper call() throws Exception {
                   return new BatchDeletePartitionsHelper(glueClient, dbName, tableName, catalogId, partitionsOnePage).deletePartitions();
